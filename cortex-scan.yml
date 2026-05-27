@@ -1,0 +1,160 @@
+name: Cortex Cloud Security Scan
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+
+  # ── Job 1: Checkov IaC + Secrets + SCA scan ────────────────────────────────
+  checkov-scan:
+    name: Checkov - IaC and Secrets
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Run Checkov scan
+        id: checkov
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: .
+          framework: all
+          output_format: cli,sarif
+          output_file_path: console,checkov-results.sarif
+          soft_fail: true
+          # Connect to Cortex Cloud / Prisma Cloud for centralized results
+          api-key: ${{ secrets.CORTEX_API_KEY }}
+
+      - name: Upload Checkov SARIF results
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: checkov-results.sarif
+          category: checkov
+
+  # ── Job 2: Trivy vulnerability scan ────────────────────────────────────────
+  trivy-scan:
+    name: Trivy - Dependencies and Secrets
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Run Trivy filesystem scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH,MEDIUM
+          exit-code: 0
+
+      - name: Upload Trivy SARIF results
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy
+
+  # ── Job 3: Bandit Python SAST scan ─────────────────────────────────────────
+  bandit-scan:
+    name: Bandit - Python SAST
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install Bandit
+        run: pip install bandit[sarif]
+
+      - name: Run Bandit SAST scan
+        run: |
+          bandit -r . \
+            -f sarif \
+            -o bandit-results.sarif \
+            --severity-level medium \
+            --exit-zero
+        continue-on-error: true
+
+      - name: Upload Bandit SARIF results
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: bandit-results.sarif
+          category: bandit
+
+  # ── Job 4: pip-audit SCA scan ───────────────────────────────────────────────
+  pip-audit:
+    name: pip-audit - Dependency CVEs
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install pip-audit
+        run: pip install pip-audit
+
+      - name: Run pip-audit
+        run: |
+          pip-audit \
+            -r requirements.txt \
+            --format json \
+            -o pip-audit-results.json \
+            --ignore-vuln PYSEC-2022-237 \
+            || true
+
+      - name: Print pip-audit summary
+        run: cat pip-audit-results.json || echo "No results file"
+
+      - name: Upload pip-audit results as artifact
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: pip-audit-results
+          path: pip-audit-results.json
+
+  # ── Job 5: GitLeaks secret scanning ────────────────────────────────────────
+  gitleaks:
+    name: GitLeaks - Secret Detection
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Run GitLeaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+
+  # ── Job 6: Summary gate ─────────────────────────────────────────────────────
+  security-gate:
+    name: Security Gate
+    runs-on: ubuntu-latest
+    needs: [checkov-scan, trivy-scan, bandit-scan, pip-audit, gitleaks]
+    if: always()
+
+    steps:
+      - name: Security scan summary
+        run: |
+          echo "========================================"
+          echo "  Cortex POC - Security Scan Complete   "
+          echo "========================================"
+          echo "Checkov : ${{ needs.checkov-scan.result }}"
+          echo "Trivy   : ${{ needs.trivy-scan.result }}"
+          echo "Bandit  : ${{ needs.bandit-scan.result }}"
+          echo "pip-audit: ${{ needs.pip-audit.result }}"
+          echo "GitLeaks: ${{ needs.gitleaks.result }}"
+          echo "========================================"
+          echo "Check Cortex Cloud for centralized results"
